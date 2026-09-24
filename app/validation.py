@@ -7,10 +7,12 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def validate_payload(payload):
-    """校验 POST /api/calibrations/solve 的请求体。
+def validate_payload(payload, max_records=24):
+    """校验求解类接口的请求体。
 
-    返回 (probes, records, base_id)；结构或取值非法时抛 ValidationError。
+    max_records: 允许的比对记录上限（solve 为 24，certificate 为 16）；
+    下限恒为 3。
+    返回 (probes, records, base_index)；结构或取值非法时抛 ValidationError。
     """
     if not isinstance(payload, dict):
         raise ValidationError("请求体必须是 JSON 对象")
@@ -46,9 +48,10 @@ def validate_payload(payload):
     # ---- 比对记录 ----
     if not isinstance(raw_records, list):
         raise ValidationError("records 必须是记录数组")
-    if not (3 <= len(raw_records) <= 24):
-        raise ValidationError("比对记录数量必须在 3 至 24 条之间（当前 %d 条）"
-                              % len(raw_records))
+    if not (3 <= len(raw_records) <= max_records):
+        raise ValidationError(
+            "比对记录数量必须在 3 至 %d 条之间（当前 %d 条）"
+            % (max_records, len(raw_records)))
 
     records = []
     rids = set()

@@ -263,3 +263,191 @@ def solve(probes, records, base_index):
     ranges[base_id] = {"min": 0, "max": 0, "tight": True}
 
     return SolveResult(feasible=True, ranges=ranges, witness=witness)
+
+
+# ---------------------------------------------------------------------------
+# 最小可追溯证书
+#
+# 在全部比对记录的子集中，直接搜索一小组“保留记录”，使其独立联立求得的
+# 每支探头紧确上下界与全量记录完全相同。目标序：
+#   1) 保留记录数最少；
+#   2) 数量相同时，保留记录的原始下标升序序列字典序最小。
+# 直接枚举子集（按目标序），不先任取一个大子集再逐条删除。
+# ---------------------------------------------------------------------------
+
+
+def _pair_edges(idx, r, ri):
+    """单条记录拆出的两条差分约束边（同 solve 中全量边的构造）。"""
+    u = idx[r["a"]]
+    v = idx[r["d"]]
+    return [
+        Edge(v, u, r["hi"], ri, "forward"),    # x[a]-x[d] <= hi
+        Edge(u, v, -r["lo"], ri, "reverse"),   # x[d]-x[a] <= -lo
+    ]
+
+
+def _undirected_reachable(n, edges, source):
+    """无向可达集合：与基准无比对路径的探头其校正值无界。"""
+    adj = [[] for _ in range(n)]
+    for e in edges:
+        adj[e.frm].append(e.to)
+        adj[e.to].append(e.frm)
+    seen = {source}
+    stack = [source]
+    while stack:
+        u = stack.pop()
+        for v in adj[u]:
+            if v not in seen:
+                seen.add(v)
+                stack.append(v)
+    return seen
+
+
+def _bounds_from_edges(n, edges, base_index):
+    """以基准为源求每支探头的 (最大下界, 最小上界)。
+
+    存在负权闭环（子集不可行）或有探头与基准不连通（区间无界）时返回 None。
+    """
+    if len(_undirected_reachable(n, edges, base_index)) != n:
+        return None
+    # n-1 轮求最短路，再补一轮：仍可松弛当且仅当存在基准可达的负权闭环。
+    # 每条记录两个方向都在图中，有向可达性等于无向连通性，故闭环必可达。
+    dist_max = [INF] * n
+    dist_max[base_index] = 0
+    for _ in range(n - 1):
+        if not _relax_scan(edges, dist_max):
+            break
+    if _relax_scan(edges, dist_max):
+        return None
+    rev_edges = [Edge(e.to, e.frm, e.weight, e.record_index, e.direction)
+                 for e in edges]
+    dist_neg = [INF] * n
+    dist_neg[base_index] = 0
+    for _ in range(n - 1):
+        if not _relax_scan(rev_edges, dist_neg):
+            break
+    if _relax_scan(rev_edges, dist_neg):
+        return None
+    return tuple((-int(dist_neg[i]), int(dist_max[i])) for i in range(n))
+
+
+def compute_bounds(probes, records, base_index):
+    """给定记录子集求各探头 (min, max)；不可行或不连通时返回 None。"""
+    n = len(probes)
+    idx = {p["id"]: i for i, p in enumerate(probes)}
+    edges = []
+    for ri, r in enumerate(records):
+        edges.extend(_pair_edges(idx, r, ri))
+    return _bounds_from_edges(n, edges, base_index)
+
+
+@dataclass
+class CertificateResult:
+    feasible: bool
+    kept_indices: tuple = ()       # 保留记录的原始下标（升序）
+    full_bounds: tuple = ()        # 全量记录下各探头 (min, max)
+    cert_bounds: tuple = ()        # 证书记录下各探头 (min, max)
+
+
+def _search_certificate(n, pairs, base_index, full_bounds):
+    """在全部记录子集中直接搜索最小证书。
+
+    pairs: [(record_index, [edge, edge]), ...]，按原始记录顺序排列。
+    返回保留记录下标升序元组；无解时返回 None。
+
+    枚举严格按目标序：先按保留记录数 k 从连通下界 n-1 起步递增；同一 k 内
+    按下标升序字典序做 DFS，首个区间逐端相等的可行子集即全局最优解。
+    全程直接在全部子集中挑选，不先任取一个大子集再逐条删除。
+    """
+    m = len(pairs)
+
+    def evaluate(combo):
+        edges = []
+        for ci in combo:
+            edges.extend(pairs[ci][1])
+        return _bounds_from_edges(n, edges, base_index)
+
+    def endpoints_union_connects(chosen, suffix_start):
+        """chosen 记录与所有下标 >= suffix_start 的记录之无向并集是否连通。
+
+        DFS 剪枝：即便把剩余所有可选记录都纳入仍无法让全部探头经基准连通，
+        则当前分支（及其后字典序更大的分支）不可能产出有界证书。
+        """
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        positions = list(chosen) + list(range(suffix_start, m))
+        for ci in positions:
+            for e in pairs[ci][1]:
+                union(e.frm, e.to)
+        root = find(base_index)
+        return all(find(v) == root for v in range(n))
+
+    # 连通 n 个顶点至少需要 n-1 条记录（每条记录只连一对探头）。
+    for k in range(max(1, n - 1), m + 1):
+        hit = []
+
+        def dfs(start, chosen):
+            if hit:
+                return
+            if len(chosen) == k:
+                if evaluate(tuple(chosen)) == full_bounds:
+                    hit.append(tuple(chosen))
+                return
+            need = k - len(chosen)  # 还需选这么多条
+            # 可选位置 start .. m-1，需给后续 need 个选择留位
+            for i in range(start, m - need + 1):
+                if hit:
+                    return
+                # i 增大只可能让“剩余可选集”缩小，故失败即可整体跳出
+                if not endpoints_union_connects(chosen, i):
+                    break
+                chosen.append(i)
+                dfs(i + 1, chosen)
+                chosen.pop()
+
+        dfs(0, [])
+        if hit:
+            return hit[0]
+    return None
+
+
+def certificate(probes, records, base_index):
+    """求最小可追溯证书。
+
+    前置：全量记录必须可行且每支探头与基准连通（否则 feasible=False，
+    调用方应沿用 solve 的 409/422 拒绝语义，不产生证书）。
+    """
+    n = len(probes)
+    idx = {p["id"]: i for i, p in enumerate(probes)}
+    pairs = [(ri, _pair_edges(idx, r, ri)) for ri, r in enumerate(records)]
+    all_edges = [e for _, es in pairs for e in es]
+
+    full_bounds = _bounds_from_edges(n, all_edges, base_index)
+    if full_bounds is None:
+        return CertificateResult(feasible=False)
+
+    kept = _search_certificate(n, pairs, base_index, full_bounds)
+    if kept is None:
+        # 全量自身必然是一个合格证书，正常不会走到这里
+        return CertificateResult(feasible=False)
+
+    cert_records = [records[i] for i in kept]
+    cert_bounds = compute_bounds(probes, cert_records, base_index)
+    assert cert_bounds == full_bounds
+    return CertificateResult(
+        feasible=True,
+        kept_indices=tuple(kept),
+        full_bounds=full_bounds,
+        cert_bounds=cert_bounds,
+    )

@@ -6,9 +6,11 @@
   3. 等待 web 服务健康后做业务 HTTP 冒烟：
        - GET /healthz、GET /
        - 可行联立：校验紧确区间、见证解、基准为 0
-       - 改动任一记录后 input_fingerprint 必须变化（旧结论撤下）
-       - 不可行联立：HTTP 409 + 矛盾闭环（记录编号/方向/上界累加 < 0）
-       - 非法输入：HTTP 422
+       - 最小可追溯证书：200 certified，保留/省略记录、全量与证书逐端相等、
+         稳定指纹；仅用保留记录独立求解区间不变
+       - 改动任一记录后 input_fingerprint 必须变化（旧结论/证书撤下）
+       - 不可行联立：HTTP 409 + 矛盾闭环（证书接口同样拒绝）
+       - 非法输入（含证书接口 >16 条）：HTTP 422
 """
 
 import json
@@ -83,6 +85,8 @@ FEASIBLE_PAYLOAD = {
         {"id": "R2", "a": "TC-B", "d": "TC-A", "lo": 0,  "hi": 2},
         {"id": "R3", "a": "TC-C", "d": "TC-B", "lo": -3, "hi": 3},
         {"id": "R4", "a": "TC-C", "d": "REF",  "lo": -2, "hi": 0},
+        # R5 对 TC-B 给出的 [-1,3] 已被 R1+R2 链式蕴含，属可省略冗余记录
+        {"id": "R5", "a": "TC-B", "d": "REF",  "lo": -1, "hi": 3},
     ],
 }
 
@@ -121,7 +125,8 @@ def smoke():
         with urllib.request.urlopen(BASE_URL + "/", timeout=5) as resp:
             html = resp.read().decode("utf-8")
         page_ok = resp.status == 200 and "热电偶" in html and \
-            "/api/calibrations/solve" in html
+            "/api/calibrations/solve" in html and \
+            "/api/calibrations/certificate" in html
         detail = ""
     except Exception as exc:  # noqa: BLE001
         page_ok = False
@@ -163,6 +168,85 @@ def smoke():
         report("改动后旧结论撤下（指纹变化）",
                d2.get("input_fingerprint") != fp0,
                "%s -> %s" % (fp0, d2.get("input_fingerprint")))
+
+        # --- 最小可追溯证书（提交当前完整可行模型） ---
+        code, cd = _request("POST", "/api/calibrations/certificate",
+                            FEASIBLE_PAYLOAD)
+        cert_ok = (code == 200 and cd.get("status") == "certified")
+        report("证书生成返回 200 certified", cert_ok,
+               "code=%s status=%s" % (code, cd.get("status")))
+        if cert_ok:
+            kept = [r["id"] for r in cd.get("retained_records", [])]
+            dropped = [r["id"] for r in cd.get("omitted_records", [])]
+            all_ids = {r["id"] for r in FEASIBLE_PAYLOAD["records"]}
+            partition_ok = (
+                set(kept).isdisjoint(dropped)
+                and set(kept) | set(dropped) == all_ids
+                and cd.get("retained_count") == len(kept)
+                and cd.get("omitted_count") == len(dropped)
+            )
+            report("证书列出保留与省略的原始记录且互斥完备",
+                   partition_ok, "保留=%s 省略=%s" % (kept, dropped))
+
+            eq_ok = all(
+                v.get("min_equal") and v.get("max_equal")
+                and v.get("full") == v.get("certificate")
+                for v in cd.get("ranges", {}).values()
+            )
+            # 与全量 solve 的区间逐端一致
+            eq_ok = eq_ok and all(
+                cd["ranges"][p]["full"] == ranges[p] for p in ranges)
+            report("每支探头证书区间与全量逐端相等", eq_ok,
+                   json.dumps(cd.get("ranges"), ensure_ascii=False))
+
+            fp_ok = (isinstance(cd.get("certificate_fingerprint"), str)
+                     and len(cd["certificate_fingerprint"]) == 16
+                     and cd.get("input_fingerprint") == fp0)
+            report("证书含稳定指纹并与全量指纹并存", fp_ok,
+                   "full=%s cert=%s"
+                   % (cd.get("input_fingerprint"),
+                      cd.get("certificate_fingerprint")))
+
+            # 独立性复核：仅用保留记录再走 solve，区间必须完全一致
+            kept_records = [r for r in FEASIBLE_PAYLOAD["records"]
+                            if r["id"] in set(kept)]
+            sub_payload = {
+                "probes": FEASIBLE_PAYLOAD["probes"],
+                "base_probe": FEASIBLE_PAYLOAD["base_probe"],
+                "records": kept_records,
+            }
+            c3, d3 = _request("POST", "/api/calibrations/solve", sub_payload)
+            indep_ok = c3 == 200 and all(
+                d3["ranges"][p] == ranges[p] for p in ranges)
+            report("仅保留记录独立求解区间与全量相同（非逐条删除凑出）",
+                   indep_ok, json.dumps(d3.get("ranges"),
+                                        ensure_ascii=False) if c3 == 200
+                   else "code=%s" % c3)
+
+    # 证书接口对不可行模型必须沿用 409 拒绝，且不产生证书
+    code, cd = _request("POST", "/api/calibrations/certificate",
+                        INFEASIBLE_PAYLOAD)
+    report("不可行模型证书接口明确拒绝（409，无证书）",
+           code == 409 and cd.get("status") == "infeasible"
+           and cd.get("rejected") is True
+           and "retained_records" not in cd
+           and cd.get("contradiction_cycle", {}).get("upper_bound_sum", 0) < 0,
+           "code=%s" % code)
+
+    # 证书接口至多 16 条记录：17 条须 422
+    too_many = {
+        "probes": ["REF", "TC-A", "TC-B"], "base_probe": "REF",
+        "records": [
+            {"id": "R%d" % i,
+             "a": "TC-A" if i % 2 else "TC-B",
+             "d": "REF", "lo": -5, "hi": 5}
+            for i in range(1, 18)],
+    }
+    code, cd = _request("POST", "/api/calibrations/certificate", too_many)
+    report("证书接口超过 16 条记录返回 422",
+           code == 422 and cd.get("status") == "invalid_input"
+           and "16" in cd.get("error", ""),
+           "code=%s error=%s" % (code, cd.get("error")))
 
     # --- 不可行联立 ---
     code, data = _request("POST", "/api/calibrations/solve", INFEASIBLE_PAYLOAD)
