@@ -58,6 +58,19 @@
   summary { cursor:pointer; color:var(--muted); font-size:12.5px; }
   pre.json { background:#0f1720; color:#d7e4ee; padding:12px; border-radius:8px;
     overflow:auto; font-size:12px; max-height:340px; }
+  .panel-cert { border:1px solid #b9cde6; background:#f2f7fc; border-radius:10px;
+    padding:16px 18px; margin-top:14px; }
+  .panel-cert h3 { margin:0 0 10px; font-size:15px; }
+  .chip { display:inline-block; padding:1px 9px; border-radius:99px; font-size:12px;
+    margin:0 6px 4px 0; }
+  .chip.keep { background:var(--ok-bg); color:var(--ok); border:1px solid #bfe3cd; }
+  .chip.skip { background:#eef1f4; color:var(--muted); border:1px solid var(--line);
+    text-decoration:line-through; }
+  .eq { color:var(--ok); font-weight:600; }
+  button.cert { background:var(--brand-weak); color:var(--brand); border-color:#9cc3e0;
+    padding:8px 18px; }
+  button.cert:hover { background:#d8e8f5; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
 </style>
 </head>
 <body>
@@ -106,8 +119,9 @@
   </section>
 
   <section id="resultWrap">
-    <div class="panel-stale" id="staleBanner" hidden>输入已改动，上一次结论已撤下，请重新“提交并联立求解”。</div>
+    <div class="panel-stale" id="staleBanner" hidden>输入已改动，上一次结论与已生成证书均已撤下，请重新“提交并联立求解”。</div>
     <div id="result"></div>
+    <div id="certResult"></div>
   </section>
 </main>
 
@@ -118,6 +132,7 @@ const recTbody = document.querySelector("#recTable tbody");
 const probeCountEl = document.getElementById("probeCount");
 const recCountEl = document.getElementById("recCount");
 const resultEl = document.getElementById("result");
+const certResultEl = document.getElementById("certResult");
 const staleBanner = document.getElementById("staleBanner");
 const formError = document.getElementById("formError");
 
@@ -128,6 +143,10 @@ function markDirty() {
   if (lastFingerprint !== null) {
     dirty = true;
     staleBanner.hidden = false;
+    // 修改任一记录后必须撤下旧证书
+    certResultEl.innerHTML = "";
+    const btn = document.getElementById("certBtn");
+    if (btn) btn.disabled = true;
   }
 }
 
@@ -262,8 +281,24 @@ function renderFeasible(data) {
     '<div class="panel-ok"><h3>✓ 联立可行：以下为全部记录同时成立下的紧确闭区间</h3>' +
     '<table><thead><tr><th>探头</th><th>校正值可取闭区间</th>' +
     '<th>见证校正值（满足全部记录）</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    '<div class="toolbar" style="margin-bottom:4px">' +
+    '<button type="button" class="cert" id="certBtn">📄 生成最小可追溯证书</button>' +
+    '<span class="count">POST /api/calibrations/certificate（限 ' +
+    probes.length + ' 支探头、至多 16 条记录）</span></div>' +
+    '<div class="err" id="certError"></div>' +
+    '<div id="certInline"></div>' +
     '<details><summary>查看原始响应 JSON</summary><pre class="json">' +
     escapeHtml(JSON.stringify(data, null, 2)) + '</pre></details></div>';
+  const certBtn = document.getElementById("certBtn");
+  const recCount = recTbody.rows.length;
+  if (recCount > 16) {
+    certBtn.disabled = true;
+    certBtn.title = "证书操作至多接受 16 条记录（当前 " + recCount + " 条）";
+    document.getElementById("certError").textContent =
+      "当前 " + recCount + " 条记录，证书操作仅接受至多 16 条，无法生成证书。";
+  } else {
+    certBtn.addEventListener("click", () => requestCertificate(certBtn));
+  }
 }
 function renderInfeasible(data) {
   const c = data.contradiction_cycle;
@@ -283,6 +318,75 @@ function renderInfeasible(data) {
     escapeHtml(JSON.stringify(data, null, 2)) + '</pre></details></div>';
 }
 
+/* ---------------- 证书 ---------------- */
+async function requestCertificate(btn) {
+  const certError = document.getElementById("certError");
+  certError.textContent = "";
+  certResultEl.innerHTML = "";
+  let payload;
+  try { payload = buildPayload(); }
+  catch (e) { certError.textContent = e.message; return; }
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = "生成中…";
+  try {
+    const resp = await fetch("/api/calibrations/certificate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (resp.status === 422) {
+      certError.textContent = data.error;
+      return;
+    }
+    if (resp.status === 409 || data.status === "infeasible") {
+      certError.textContent = "模型已不可行（记录联立矛盾），不产生证书。";
+      return;
+    }
+    if (data.status !== "certificate") {
+      certError.textContent = data.error || "证书生成失败";
+      return;
+    }
+    renderCertificate(data);
+  } catch (e) {
+    certError.textContent = "请求失败：" + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+function renderCertificate(c) {
+  const keep = c.retained_record_ids.map(id =>
+    '<span class="chip keep">保留 ' + escapeHtml(id) + "</span>").join("");
+  const skip = c.omitted_record_ids.map(id =>
+    '<span class="chip skip">省略 ' + escapeHtml(id) + "</span>").join("") ||
+    '<span class="count">（无省略记录）</span>';
+  const rows = c.probe_ranges.map(pr =>
+    "<tr><td class=\"mono\">" + escapeHtml(pr.probe) +
+    (pr.is_base ? ' <span class="badge base">基准</span>' : "") + "</td>" +
+    '<td class="mono">[ ' + pr.full.min + " , " + pr.full.max + " ]</td>" +
+    '<td class="mono">[ ' + pr.certificate.min + " , " + pr.certificate.max + " ]</td>" +
+    '<td class="eq">' + (pr.min_equal && pr.max_equal ? "＝ 逐端相等" : "≠ 不一致") +
+    "</td></tr>").join("");
+  certResultEl.innerHTML =
+    '<div class="panel-cert"><h3>📄 最小可追溯证书</h3>' +
+    '<p class="hint" style="margin:0 0 8px">仅需调阅 <strong>' +
+    c.retained_count + "</strong> 条保留记录独立联立，即可复现全部 " +
+    (c.retained_count + c.omitted_count) + " 条记录下每支探头的紧确闭区间；" +
+    "选择规则：先最少化保留数，同数按编号升序序列取字典序最小（直接枚举全部子集，共评估 " +
+    c.selection.subsets_evaluated + " 组，非逐条贪心删除）。</p>" +
+    '<p style="margin:4px 0"><strong>保留记录：</strong>' + keep + "</p>" +
+    '<p style="margin:4px 0"><strong>省略记录：</strong>' + skip + "</p>" +
+    '<table><thead><tr><th>探头</th><th>全量记录区间</th>' +
+    "<th>证书区间（仅保留记录）</th><th>逐端核对</th></tr></thead><tbody>" +
+    rows + "</tbody></table>" +
+    '<p class="hint mono" style="margin:10px 0 0">输入指纹 ' +
+    c.input_fingerprint + "　证书稳定指纹 " + c.certificate_fingerprint + "</p>" +
+    "<details><summary>查看证书原始响应 JSON</summary><pre class=\"json\">" +
+    escapeHtml(JSON.stringify(c, null, 2)) + "</pre></details></div>";
+}
+
 /* ---------------- 提交 ---------------- */
 document.getElementById("addProbe").addEventListener("click", () => addProbe());
 document.getElementById("addRec").addEventListener("click", () => addRecord());
@@ -300,6 +404,8 @@ document.getElementById("solveBtn").addEventListener("click", async () => {
     if (resp.status === 422) { formError.textContent = data.error; return; }
     lastFingerprint = data.input_fingerprint || null;
     dirty = false; staleBanner.hidden = true;
+    // 重新联立后旧证书必须撤下，等待在新可行结果旁重新生成
+    certResultEl.innerHTML = "";
     if (data.status === "feasible") renderFeasible(data);
     else if (data.status === "infeasible") renderInfeasible(data);
     else { formError.textContent = data.error || "未知响应"; }
@@ -317,7 +423,7 @@ document.getElementById("sampleBtn").addEventListener("click", () => {
   recTbody.innerHTML = "";
   [["TC-A","REF",-1,1], ["TC-B","TC-A",0,2], ["TC-C","TC-B",-3,3],
    ["TC-C","REF",-2,0]].forEach(r => addRecord(r[0], r[1], r[2], r[3]));
-  resultEl.innerHTML = ""; lastFingerprint = null;
+  resultEl.innerHTML = ""; certResultEl.innerHTML = ""; lastFingerprint = null;
   staleBanner.hidden = true; formError.textContent = "";
 });
 

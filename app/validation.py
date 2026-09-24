@@ -7,9 +7,11 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def validate_payload(payload):
-    """校验 POST /api/calibrations/solve 的请求体。
+def validate_payload(payload, min_records=3, max_records=24):
+    """校验 POST /api/calibrations/solve 与 /certificate 的请求体。
 
+    两接口模型完全一致，仅允许的比对记录条数上限不同（求解 24 条、
+    生成证书 16 条）。
     返回 (probes, records, base_id)；结构或取值非法时抛 ValidationError。
     """
     if not isinstance(payload, dict):
@@ -46,9 +48,9 @@ def validate_payload(payload):
     # ---- 比对记录 ----
     if not isinstance(raw_records, list):
         raise ValidationError("records 必须是记录数组")
-    if not (3 <= len(raw_records) <= 24):
-        raise ValidationError("比对记录数量必须在 3 至 24 条之间（当前 %d 条）"
-                              % len(raw_records))
+    if not (min_records <= len(raw_records) <= max_records):
+        raise ValidationError("比对记录数量必须在 %d 至 %d 条之间（当前 %d 条）"
+                              % (min_records, max_records, len(raw_records)))
 
     records = []
     rids = set()

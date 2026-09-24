@@ -2,13 +2,16 @@
 
 在 verify 容器中运行：
   1. py_compile 全量语法构建检查
-  2. unittest 代码测试（求解器 + HTTP 层）
+  2. unittest 代码测试（求解器 + 证书 + HTTP 层）
   3. 等待 web 服务健康后做业务 HTTP 冒烟：
        - GET /healthz、GET /
        - 可行联立：校验紧确区间、见证解、基准为 0
        - 改动任一记录后 input_fingerprint 必须变化（旧结论撤下）
        - 不可行联立：HTTP 409 + 矛盾闭环（记录编号/方向/上界累加 < 0）
        - 非法输入：HTTP 422
+       - 最小可追溯证书：201、保留/省略清单、证书区间与全量逐端相等、
+         保留子集独立联立复现全量区间、稳定指纹；17 条记录 422；
+         不可行/不连通模型不产生证书（409/422）
 """
 
 import json
@@ -121,7 +124,8 @@ def smoke():
         with urllib.request.urlopen(BASE_URL + "/", timeout=5) as resp:
             html = resp.read().decode("utf-8")
         page_ok = resp.status == 200 and "热电偶" in html and \
-            "/api/calibrations/solve" in html
+            "/api/calibrations/solve" in html and \
+            "/api/calibrations/certificate" in html
         detail = ""
     except Exception as exc:  # noqa: BLE001
         page_ok = False
@@ -194,6 +198,95 @@ def smoke():
     code, data = _request("POST", "/api/calibrations/solve", bad)
     report("非法输入（下界>上界）返回 422",
            code == 422 and data.get("status") == "invalid_input",
+           "code=%s error=%s" % (code, data.get("error")))
+
+    # --- 最小可追溯证书 ---
+    code, data = _request("POST", "/api/calibrations/certificate",
+                          FEASIBLE_PAYLOAD)
+    ok = code == 201 and data.get("status") == "certificate"
+    report("生成最小可追溯证书返回 201", ok, "code=%s" % code)
+    if ok:
+        full_ranges = ranges
+        keep = set(data.get("retained_record_ids", []))
+        skip = set(data.get("omitted_record_ids", []))
+        partition_ok = (
+            keep | skip == {"R1", "R2", "R3", "R4"}
+            and keep & skip == set()
+            and data.get("retained_count") == len(keep)
+            and data.get("omitted_count") == len(skip)
+        )
+        # R3（TC-C 与 TC-B 的宽区间 [-3,3]）被 R1+R2+R4 蕴含，应省略
+        expected_ok = keep == {"R1", "R2", "R4"} and skip == {"R3"}
+        report("证书列出保留/省略原始记录且直接穷举选优",
+               partition_ok and expected_ok,
+               "保留=%s 省略=%s 评估子集=%s"
+               % (sorted(keep), sorted(skip),
+                  data.get("selection", {}).get("subsets_evaluated")))
+
+        probe_ok = all(
+            pr.get("min_equal") and pr.get("max_equal")
+            and pr.get("full") == pr.get("certificate")
+            for pr in data.get("probe_ranges", [])
+        ) and {pr["probe"]: pr["full"]
+               for pr in data["probe_ranges"]} == full_ranges
+        report("每支探头全量与证书区间逐端相等", probe_ok,
+               json.dumps(
+                   [(pr["probe"], pr["full"], pr["certificate"])
+                    for pr in data.get("probe_ranges", [])],
+                   ensure_ascii=False))
+
+        fp_ok = (data.get("input_fingerprint") == fp0
+                 and len(data.get("certificate_fingerprint", "")) == 16)
+        report("证书携带输入指纹（与求解一致）与稳定证书指纹", fp_ok,
+               "input=%s cert=%s"
+               % (data.get("input_fingerprint"),
+                  data.get("certificate_fingerprint")))
+
+        # 保留记录子集独立联立，区间必须与全量完全相同
+        sub_payload = {
+            "probes": FEASIBLE_PAYLOAD["probes"],
+            "base_probe": FEASIBLE_PAYLOAD["base_probe"],
+            "records": data["retained_records"],
+        }
+        code3, d3 = _request("POST", "/api/calibrations/solve", sub_payload)
+        report("保留记录独立联立复现全量紧确闭区间",
+               code3 == 200 and d3.get("ranges") == full_ranges,
+               "code=%s" % code3)
+
+    # 17 条记录：证书接口 422（上限 16），求解接口仍 200（上限 24）
+    many = json.loads(json.dumps(FEASIBLE_PAYLOAD))
+    for i in range(13):
+        many["records"].append(
+            {"id": "X%02d" % i, "a": "TC-A", "d": "REF",
+             "lo": -10, "hi": 10})
+    code_a, da = _request("POST", "/api/calibrations/certificate", many)
+    code_b, db = _request("POST", "/api/calibrations/solve", many)
+    report("证书至多 16 条（17 条 422）而求解接口语义不变（200）",
+           code_a == 422 and "16" in da.get("error", "")
+           and code_b == 200 and db.get("status") == "feasible",
+           "cert=%s solve=%s" % (code_a, code_b))
+
+    # 不可行模型：证书接口沿用 409 拒绝且不产生证书
+    code, data = _request("POST", "/api/calibrations/certificate",
+                          INFEASIBLE_PAYLOAD)
+    report("不可行模型不产生证书（409 + 矛盾闭环）",
+           code == 409 and data.get("status") == "infeasible"
+           and data.get("rejected") is True
+           and "certificate_fingerprint" not in data,
+           "code=%s" % code)
+
+    # 无基准连通性：证书接口 422
+    disconnected = {
+        "probes": ["REF", "TC-A", "TC-X"], "base_probe": "REF",
+        "records": [
+            {"id": "R1", "a": "TC-A", "d": "REF", "lo": 0, "hi": 1},
+            {"id": "R2", "a": "TC-A", "d": "REF", "lo": 0, "hi": 1},
+            {"id": "R3", "a": "TC-A", "d": "REF", "lo": 0, "hi": 1}],
+    }
+    code, data = _request("POST", "/api/calibrations/certificate",
+                          disconnected)
+    report("无基准连通性不产生证书（422）",
+           code == 422 and "TC-X" in data.get("error", ""),
            "code=%s error=%s" % (code, data.get("error")))
 
 

@@ -1,12 +1,15 @@
 """热电偶校正值联立服务（纯标准库 HTTP）。
 
 路由：
-  GET  /                      录入页面
-  GET  /healthz               健康检查
-  POST /api/calibrations/solve 提交探头与比对记录，返回联立结果
+  GET  /                              录入页面
+  GET  /healthz                       健康检查
+  POST /api/calibrations/solve        提交探头与比对记录，返回联立结果
+  POST /api/calibrations/certificate  在可行模型上生成最小可追溯证书
 
 每次 POST 都依据当次请求体重算，不沿用上一次结论；响应携带本次输入
-指纹，旧结论在记录改动后自然撤下。
+指纹，旧结论在记录改动后自然撤下。证书接口提交的是与求解接口相同的
+完整模型，并在服务端重新完整求解；不可行 / 无基准连通性 / 字段非法时
+沿用同一套明确拒绝语义，绝不产生证书。
 """
 
 import hashlib
@@ -14,6 +17,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .certificate import build_certificate
 from .solver import solve, ValidationError as SolverValidationError
 from .validation import validate_payload, ValidationError
 
@@ -23,6 +27,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def _fingerprint(probes, records, base_id):
     blob = json.dumps(
         {"probes": probes, "base": base_id, "records": records},
+        sort_keys=True, ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _certificate_fingerprint(cert):
+    """证书稳定指纹：保留/省略清单与逐端区间核对结果的哈希。"""
+    blob = json.dumps(
+        {
+            "base": cert["base_probe"],
+            "retained": cert["retained_records"],
+            "omitted": cert["omitted_records"],
+            "ranges": cert["probe_ranges"],
+        },
         sort_keys=True, ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
@@ -52,6 +70,27 @@ def solve_payload(payload):
         response["rejected"] = True
         response["contradiction_cycle"] = result.cycle.describe(records)
     return response
+
+
+def certificate_payload(payload):
+    """纯逻辑入口，便于测试：先跑与 solve 完全相同的校验与全量求解，
+    可行才生成证书；拒绝时直接抛出，由 HTTP 层映射为 409/422。"""
+    probes, records, base_index = validate_payload(payload, max_records=16)
+    base_id = probes[base_index]["id"]
+    result = solve(probes, records, base_index)
+    if not result.feasible:
+        return {
+            "status": "infeasible",
+            "base_probe": base_id,
+            "input_fingerprint": _fingerprint(probes, records, base_id),
+            "rejected": True,
+            "contradiction_cycle": result.cycle.describe(records),
+        }
+
+    cert = build_certificate(probes, records, base_index, result)
+    cert["input_fingerprint"] = _fingerprint(probes, records, base_id)
+    cert["certificate_fingerprint"] = _certificate_fingerprint(cert)
+    return cert
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -88,7 +127,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/api/calibrations/solve":
+        if path not in ("/api/calibrations/solve",
+                        "/api/calibrations/certificate"):
             self._send_json(404, {"error": "not found"})
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -102,11 +142,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "请求体不是合法 JSON"})
             return
         try:
-            response = solve_payload(payload)
+            if path == "/api/calibrations/certificate":
+                response = certificate_payload(payload)
+            else:
+                response = solve_payload(payload)
         except (ValidationError, SolverValidationError) as exc:
             self._send_json(422, {"status": "invalid_input", "error": str(exc)})
             return
-        code = 200 if response["status"] == "feasible" else 409
+        if response["status"] == "feasible":
+            code = 200
+        elif response["status"] == "certificate":
+            code = 201
+        else:  # infeasible：证书接口同样明确拒绝，不产生证书
+            code = 409
         self._send_json(code, response)
 
     def log_message(self, fmt, *args):
