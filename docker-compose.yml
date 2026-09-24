@@ -1,0 +1,32 @@
+services:
+  web:
+    build: .
+    image: thermocouple-calib:latest
+    environment:
+      # 容器内监听端口（固定）；宿主机映射端口由 WEB_PORT 控制
+      PORT: "8000"
+    ports:
+      # 宿主机端口可配置：export WEB_PORT=8080 后再 up
+      - "${WEB_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: thermocouple-calib:latest
+    environment:
+      BASE_URL: "http://web:8000"
+      PYTHONPATH: "/srv"
+    depends_on:
+      web:
+        condition: service_healthy
+    # 一次性验收服务：代码测试 + 构建检查 + 业务 HTTP 冒烟，
+    # 完成后自行退出，退出码即验收结论（非 0 表示失败）
+    command: ["python", "verify/smoke.py"]
+    restart: "no"

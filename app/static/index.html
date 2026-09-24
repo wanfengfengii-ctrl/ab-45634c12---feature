@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>热电偶校正值联立求解</title>
+<style>
+  :root {
+    --bg:#f4f6f8; --card:#fff; --line:#d9dee4; --ink:#1f2933;
+    --muted:#64717e; --brand:#145a8a; --brand-weak:#e8f1f8;
+    --ok:#0f7b3c; --ok-bg:#e8f6ee; --bad:#b42318; --bad-bg:#fdeceb;
+    --warn:#8a5a00; --warn-bg:#fff6e0;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  header { background:var(--brand); color:#fff; padding:18px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; opacity:.85; font-size:13px; }
+  main { max-width:1080px; margin:20px auto; padding:0 16px 48px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+    padding:18px 20px; margin-bottom:18px; }
+  .card h2 { margin:0 0 12px; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .hint { color:var(--muted); font-size:12.5px; margin:0 0 12px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line);
+    font-size:13.5px; vertical-align:middle; }
+  th { color:var(--muted); font-weight:600; font-size:12.5px; }
+  input[type=text], input[type=number], select {
+    width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:6px;
+    font:inherit; background:#fff; color:inherit; }
+  input:focus, select:focus { outline:2px solid #9cc3e0; border-color:var(--brand); }
+  .row-actions { width:40px; text-align:center; }
+  button { cursor:pointer; font:inherit; border-radius:6px; border:1px solid var(--line);
+    background:#fff; padding:6px 12px; }
+  button:hover { border-color:var(--brand); color:var(--brand); }
+  button.primary { background:var(--brand); color:#fff; border-color:var(--brand);
+    padding:9px 22px; font-size:14px; }
+  button.primary:hover { background:#0e4a72; color:#fff; }
+  button.danger { color:var(--bad); }
+  .toolbar { display:flex; gap:10px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+  .count { color:var(--muted); font-size:12.5px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; }
+  .badge.base { background:var(--brand-weak); color:var(--brand); }
+  .badge.tight { background:var(--ok-bg); color:var(--ok); }
+  .panel-ok { border:1px solid #bfe3cd; background:var(--ok-bg); border-radius:10px;
+    padding:16px 18px; }
+  .panel-bad { border:1px solid #f0c4c0; background:var(--bad-bg); border-radius:10px;
+    padding:16px 18px; }
+  .panel-stale { border:1px solid #ecd9a8; background:var(--warn-bg); color:var(--warn);
+    border-radius:10px; padding:12px 16px; margin-bottom:14px; font-size:13px; }
+  .panel-ok h3, .panel-bad h3 { margin:0 0 10px; font-size:15px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,mon-serif; }
+  .err { color:var(--bad); font-size:13px; margin-top:8px; white-space:pre-wrap; }
+  .cycle-step { margin:0 0 2px; }
+  .form-error { color:var(--bad); font-weight:600; }
+  details { margin-top:10px; }
+  summary { cursor:pointer; color:var(--muted); font-size:12.5px; }
+  pre.json { background:#0f1720; color:#d7e4ee; padding:12px; border-radius:8px;
+    overflow:auto; font-size:12px; max-height:340px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>航空发动机叶片热处理 · 热电偶校正值联立求解</h1>
+  <p>全部比对记录同时纳入一套差分约束求解，基准探头校正值固定为零；不逐条独立取中值，避免炉温窗口相互矛盾。</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 热电偶编号（3–10 支，唯一）与基准探头</h2>
+    <p class="hint">基准探头的校正值固定为 0，其余探头的校正区间均相对它联立求出。</p>
+    <table id="probeTable">
+      <thead><tr><th style="width:48px">#</th><th>热电偶唯一编号</th>
+        <th style="width:170px">基准指定</th><th class="row-actions"></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="toolbar">
+      <button type="button" id="addProbe">＋ 增加探头</button>
+      <span class="count" id="probeCount"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. 双向连通比对记录（3–24 条）</h2>
+    <p class="hint">每条记录给出两支探头与校正后温差允许的<strong>整数闭区间</strong> [下界, 上界]，
+      语义：下界 ≤ x(探头A) − x(探头D) ≤ 上界。记录编号按行号自动生成（R1、R2……），矛盾闭环将据此定位。</p>
+    <table id="recTable">
+      <thead><tr><th style="width:54px">记录号</th><th>探头 A</th><th>探头 D</th>
+        <th style="width:130px">下界（含）</th><th style="width:130px">上界（含）</th>
+        <th class="row-actions"></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="toolbar">
+      <button type="button" id="addRec">＋ 增加比对记录</button>
+      <span class="count" id="recCount"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="toolbar" style="margin-top:0">
+      <button type="button" class="primary" id="solveBtn">提交并联立求解</button>
+      <button type="button" id="sampleBtn">填入示例</button>
+      <span class="count">POST /api/calibrations/solve</span>
+    </div>
+    <div class="err" id="formError"></div>
+  </section>
+
+  <section id="resultWrap">
+    <div class="panel-stale" id="staleBanner" hidden>输入已改动，上一次结论已撤下，请重新“提交并联立求解”。</div>
+    <div id="result"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const probeTbody = document.querySelector("#probeTable tbody");
+const recTbody = document.querySelector("#recTable tbody");
+const probeCountEl = document.getElementById("probeCount");
+const recCountEl = document.getElementById("recCount");
+const resultEl = document.getElementById("result");
+const staleBanner = document.getElementById("staleBanner");
+const formError = document.getElementById("formError");
+
+let lastFingerprint = null;
+let dirty = false;
+
+function markDirty() {
+  if (lastFingerprint !== null) {
+    dirty = true;
+    staleBanner.hidden = false;
+  }
+}
+
+/* ---------------- 探头区 ---------------- */
+function addProbe(idVal) {
+  const n = probeTbody.rows.length;
+  if (n >= 10) return;
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    '<td class="idx"></td>' +
+    '<td><input type="text" class="p-id" maxlength="40" placeholder="如 TC-' + (n + 1) + '"></td>' +
+    '<td><label class="base-pick"><input type="radio" name="baseProbe"> 设为基准</label>' +
+    '<td class="row-actions"><button type="button" class="danger del-probe">删</button></td>';
+  tr.querySelector(".p-id").value = idVal || "";
+  tr.querySelector(".p-id").addEventListener("input", () => { syncRecProbeOptions(); markDirty(); });
+  tr.querySelector(".base-pick").addEventListener("change", markDirty);
+  tr.querySelector(".del-probe").addEventListener("click", () => {
+    if (probeTbody.rows.length <= 3) return;
+    tr.remove(); renumberProbes(); syncRecProbeOptions(); markDirty();
+  });
+  probeTbody.appendChild(tr);
+  renumberProbes();
+  syncRecProbeOptions();
+  markDirty();
+}
+function renumberProbes() {
+  [...probeTbody.rows].forEach((tr, i) => { tr.querySelector(".idx").textContent = i + 1; });
+  probeCountEl.textContent = "当前 " + probeTbody.rows.length + " 支（允许 3–10）";
+  document.getElementById("addProbe").disabled = probeTbody.rows.length >= 10;
+}
+function getProbes() {
+  return [...probeTbody.querySelectorAll(".p-id")].map(i => i.value.trim());
+}
+function getBaseIndex() {
+  const radios = [...probeTbody.querySelectorAll('input[name="baseProbe"]')];
+  return radios.findIndex(r => r.checked);
+}
+
+/* ---------------- 记录区 ---------------- */
+function addRecord(a, d, lo, hi) {
+  if (recTbody.rows.length >= 24) return;
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    '<td class="rid mono"></td>' +
+    '<td><select class="r-a"></select></td>' +
+    '<td><select class="r-d"></select></td>' +
+    '<td><input type="number" class="r-lo" step="1" placeholder="-2"></td>' +
+    '<td><input type="number" class="r-hi" step="1" placeholder="2"></td>' +
+    '<td class="row-actions"><button type="button" class="danger del-rec">删</button></td>';
+  tr.querySelector(".r-a").addEventListener("change", markDirty);
+  tr.querySelector(".r-d").addEventListener("change", markDirty);
+  tr.querySelector(".r-lo").addEventListener("input", markDirty);
+  tr.querySelector(".r-hi").addEventListener("input", markDirty);
+  tr.querySelector(".del-rec").addEventListener("click", () => {
+    if (recTbody.rows.length <= 3) return;
+    tr.remove(); renumberRecs(); markDirty();
+  });
+  tr.querySelector(".r-lo").value = (lo === undefined) ? "" : lo;
+  tr.querySelector(".r-hi").value = (hi === undefined) ? "" : hi;
+  tr.dataset.prefA = a || ""; tr.dataset.prefD = d || "";
+  recTbody.appendChild(tr);
+  syncRecProbeOptions();
+  renumberRecs();
+  markDirty();
+}
+function renumberRecs() {
+  [...recTbody.rows].forEach((tr, i) => { tr.querySelector(".rid").textContent = "R" + (i + 1); });
+  recCountEl.textContent = "当前 " + recTbody.rows.length + " 条（允许 3–24）";
+  document.getElementById("addRec").disabled = recTbody.rows.length >= 24;
+}
+function syncRecProbeOptions() {
+  const probes = getProbes();
+  [...recTbody.rows].forEach(tr => {
+    [".r-a", ".r-d"].forEach(cls => {
+      const sel = tr.querySelector(cls);
+      const keep = sel.value || (cls === ".r-a" ? tr.dataset.prefA : tr.dataset.prefD);
+      sel.innerHTML = '<option value="">— 选择探头 —</option>' +
+        probes.map(p => '<option value="' + escapeHtml(p) + '">' + escapeHtml(p) + '</option>').join("");
+      sel.value = probes.includes(keep) ? keep : "";
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+}
+
+/* ---------------- 组装与校验 ---------------- */
+function buildPayload() {
+  const probes = getProbes();
+  if (probes.length < 3 || probes.length > 10) throw new Error("探头数量必须在 3–10 支之间");
+  if (probes.some(p => !p)) throw new Error("存在空的探头编号");
+  const dup = probes.find((p, i) => probes.indexOf(p) !== i);
+  if (dup) throw new Error("热电偶编号重复：" + dup);
+  const baseIdx = getBaseIndex();
+  if (baseIdx < 0) throw new Error("必须指定一支基准探头");
+
+  const records = [...recTbody.rows].map((tr, i) => {
+    const a = tr.querySelector(".r-a").value;
+    const d = tr.querySelector(".r-d").value;
+    const loRaw = tr.querySelector(".r-lo").value.trim();
+    const hiRaw = tr.querySelector(".r-hi").value.trim();
+    if (!a || !d) throw new Error("记录 R" + (i + 1) + " 未选全两支探头");
+    if (a === d) throw new Error("记录 R" + (i + 1) + " 的两支探头不能相同");
+    if (!/^[+-]?\d+$/.test(loRaw) || !/^[+-]?\d+$/.test(hiRaw))
+      throw new Error("记录 R" + (i + 1) + " 的区间端点必须是整数");
+    const lo = parseInt(loRaw, 10), hi = parseInt(hiRaw, 10);
+    if (lo > hi) throw new Error("记录 R" + (i + 1) + " 的下界不能大于上界");
+    return { id: "R" + (i + 1), a, d, lo, hi };
+  });
+  if (records.length < 3 || records.length > 24)
+    throw new Error("比对记录数量必须在 3–24 条之间");
+
+  return { probes, base_probe: probes[baseIdx], records };
+}
+
+/* ---------------- 结果渲染 ---------------- */
+function renderFeasible(data) {
+  const probes = getProbes();
+  let rows = probes.map(p => {
+    const rg = data.ranges[p] || { min:"-", max:"-", tight:false };
+    const w = data.witness[p];
+    const isBase = p === data.base_probe;
+    return '<tr><td class="mono">' + escapeHtml(p) +
+      (isBase ? ' <span class="badge base">基准</span>' : "") + '</td>' +
+      '<td class="mono">[ ' + rg.min + ' , ' + rg.max + ' ]' +
+      (rg.tight ? ' <span class="badge tight">单点</span>' : "") + '</td>' +
+      '<td class="mono">' + w + '</td></tr>';
+  }).join("");
+  resultEl.innerHTML =
+    '<div class="panel-ok"><h3>✓ 联立可行：以下为全部记录同时成立下的紧确闭区间</h3>' +
+    '<table><thead><tr><th>探头</th><th>校正值可取闭区间</th>' +
+    '<th>见证校正值（满足全部记录）</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    '<details><summary>查看原始响应 JSON</summary><pre class="json">' +
+    escapeHtml(JSON.stringify(data, null, 2)) + '</pre></details></div>';
+}
+function renderInfeasible(data) {
+  const c = data.contradiction_cycle;
+  const steps = c.steps.map((s, i) =>
+    '<p class="cycle-step mono">' + (i + 1) + '. 记录 ' + escapeHtml(s.record_id) +
+    '（' + s.usage + '）上界 ' + s.upper_bound +
+    ' &nbsp;<span style="color:var(--muted)">' + escapeHtml(s.text.replace(/^记录 \S+ /, "")) +
+    '</span></p>').join("");
+  resultEl.innerHTML =
+    '<div class="panel-bad"><h3>✗ 明确拒绝：全部比对记录无法同时成立</h3>' +
+    '<p style="margin:0 0 8px">定位到以下由原始记录构成的<strong>矛盾闭环</strong>：</p>' +
+    steps +
+    '<p style="margin:10px 0 0"><strong>区间上界累加值 = ' + c.upper_bound_sum +
+    '（&lt; 0）</strong></p><p class="hint" style="color:var(--bad)">' +
+    escapeHtml(c.explanation) + '</p>' +
+    '<details><summary>查看原始响应 JSON</summary><pre class="json">' +
+    escapeHtml(JSON.stringify(data, null, 2)) + '</pre></details></div>';
+}
+
+/* ---------------- 提交 ---------------- */
+document.getElementById("addProbe").addEventListener("click", () => addProbe());
+document.getElementById("addRec").addEventListener("click", () => addRecord());
+document.getElementById("solveBtn").addEventListener("click", async () => {
+  formError.textContent = "";
+  let payload;
+  try { payload = buildPayload(); }
+  catch (e) { formError.textContent = e.message; return; }
+  try {
+    const resp = await fetch("/api/calibrations/solve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (resp.status === 422) { formError.textContent = data.error; return; }
+    lastFingerprint = data.input_fingerprint || null;
+    dirty = false; staleBanner.hidden = true;
+    if (data.status === "feasible") renderFeasible(data);
+    else if (data.status === "infeasible") renderInfeasible(data);
+    else { formError.textContent = data.error || "未知响应"; }
+  } catch (e) {
+    formError.textContent = "请求失败：" + e.message;
+  }
+});
+
+/* ---------------- 示例 ---------------- */
+document.getElementById("sampleBtn").addEventListener("click", () => {
+  probeTbody.innerHTML = "";
+  ["REF", "TC-A", "TC-B", "TC-C"].forEach(p => addProbe(p));
+  const baseRadio = probeTbody.querySelectorAll('input[name="baseProbe"]')[0];
+  if (baseRadio) baseRadio.checked = true;
+  recTbody.innerHTML = "";
+  [["TC-A","REF",-1,1], ["TC-B","TC-A",0,2], ["TC-C","TC-B",-3,3],
+   ["TC-C","REF",-2,0]].forEach(r => addRecord(r[0], r[1], r[2], r[3]));
+  resultEl.innerHTML = ""; lastFingerprint = null;
+  staleBanner.hidden = true; formError.textContent = "";
+});
+
+/* 初始：3 探头 3 记录，满足最低数量要求 */
+addProbe("REF"); addProbe("TC-A"); addProbe("TC-B");
+probeTbody.querySelector('input[name="baseProbe"]').checked = true;
+addRecord("TC-A", "REF", -2, 2);
+addRecord("TC-B", "TC-A", -1, 1);
+addRecord("TC-B", "REF", -3, 3);
+lastFingerprint = null; dirty = false;
+</script>
+</body>
+</html>
